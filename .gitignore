@@ -26,7 +26,6 @@ outputs/halo_masked_zero_test/
 outputs/halo_previews/
 outputs/halo_preview_test/
 outputs/halo_preview_zero_test/
-outputs/segments/
 
 # Large microscopy inputs
 work/
