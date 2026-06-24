@@ -173,39 +173,49 @@ def write_csv_header(path: Path) -> None:
                 "file",
                 "measurement_group",
                 "layer_index",
-                "bead_index",
-                "center_x",
-                "center_y",
-                "radius",
-                "diameter",
-                "mean_brightness",
-                "min_brightness",
-                "max_brightness",
-                "pixel_count",
+                "bead_count",
+                "mean_of_bead_mean_brightness",
+                "median_of_bead_mean_brightness",
+                "q1_of_bead_mean_brightness",
+                "q3_of_bead_mean_brightness",
+                "iqr_of_bead_mean_brightness",
+                "min_of_bead_mean_brightness",
+                "max_of_bead_mean_brightness",
             ]
         )
 
 
-def append_beads_to_csv(path: Path, file_path: Path, group: str, layer_index: int, beads: list[Bead]) -> None:
+def append_bead_summary_to_csv(path: Path, file_path: Path, group: str, layer_index: int, beads: list[Bead]) -> None:
+    bead_means = np.array([bead.mean_brightness for bead in beads], dtype=np.float64)
+    if bead_means.size:
+        q1, median, q3 = np.percentile(bead_means, (25, 50, 75))
+        mean_value = float(np.mean(bead_means))
+        min_value = float(np.min(bead_means))
+        max_value = float(np.max(bead_means))
+        iqr = float(q3 - q1)
+        summary_values = [
+            f"{mean_value:.3f}",
+            f"{median:.3f}",
+            f"{q1:.3f}",
+            f"{q3:.3f}",
+            f"{iqr:.3f}",
+            f"{min_value:.3f}",
+            f"{max_value:.3f}",
+        ]
+    else:
+        summary_values = [""] * 7
+
     with path.open("a", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle)
-        for bead in beads:
-            writer.writerow(
-                [
-                    file_path.name,
-                    group,
-                    layer_index,
-                    bead.index,
-                    f"{bead.x:.3f}",
-                    f"{bead.y:.3f}",
-                    f"{bead.radius:.3f}",
-                    f"{2.0 * bead.radius:.3f}",
-                    f"{bead.mean_brightness:.3f}",
-                    bead.min_brightness,
-                    bead.max_brightness,
-                    bead.pixel_count,
-                ]
-            )
+        writer.writerow(
+            [
+                file_path.name,
+                group,
+                layer_index,
+                len(beads),
+                *summary_values,
+            ]
+        )
 
 
 def process_file(path: Path, args: argparse.Namespace, csv_path: Path) -> None:
@@ -243,8 +253,8 @@ def process_file(path: Path, args: argparse.Namespace, csv_path: Path) -> None:
         min_roi_fraction=args.min_roi_fraction,
     )
 
-    append_beads_to_csv(csv_path, path, "layer1", args.layer1, beads1)
-    append_beads_to_csv(csv_path, path, "layer2", args.layer2, beads2)
+    append_bead_summary_to_csv(csv_path, path, "layer1", args.layer1, beads1)
+    append_bead_summary_to_csv(csv_path, path, "layer2", args.layer2, beads2)
 
     if args.preview_dir:
         draw_bead_preview(layer1, beads1, args.preview_dir / f"{path.stem}_layer{args.layer1}_beads.png", (0, 255, 0))

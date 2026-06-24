@@ -3,7 +3,8 @@ from __future__ import annotations
 import argparse
 import csv
 import math
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Iterable
 
@@ -26,14 +27,19 @@ class Circle:
 @dataclass(frozen=True)
 class Square:
     circle_index: int
+    roi_number: int | None
     center_x: float
     center_y: float
+    circle_radius: float
     diameter: float
     x0: int
     y0: int
     x1: int
     y1: int
-    bright_pixel_count: int | None = None
+    cell_region_area: int | None = None
+    cell_region_circularity: float | None = None
+    matching_cell_region_count: int | None = None
+    cell_search_radius: float | None = None
 
     @property
     def width(self) -> int:
@@ -296,6 +302,8 @@ def write_or_show_circle_preview(
     low_percentile: float,
     high_percentile: float,
     invert: bool,
+    show_roi_numbers: bool,
+    roi_numbers: dict[int, int] | None = None,
 ) -> None:
     if output_path is None and not show_window:
         return
@@ -309,6 +317,28 @@ def write_or_show_circle_preview(
         radius = max(1, int(round(circle.radius * scale)))
         cv2.circle(preview, center, radius, (0, 255, 0), 2, lineType=cv2.LINE_8)
         cv2.circle(preview, center, 3, (0, 0, 255), -1, lineType=cv2.LINE_8)
+        if show_roi_numbers and roi_numbers is not None and circle.index in roi_numbers:
+            label = str(roi_numbers[circle.index])
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            font_scale = max(0.45, min(1.2, radius / 35.0))
+            thickness = max(1, int(round(font_scale * 2.0)))
+            (text_width, text_height), baseline = cv2.getTextSize(label, font, font_scale, thickness)
+            padding = max(3, int(round(font_scale * 5.0)))
+            text_origin = (
+                int(round(center[0] - text_width / 2.0)),
+                int(round(center[1] + (text_height - baseline) / 2.0)),
+            )
+            box_top_left = (
+                text_origin[0] - padding,
+                text_origin[1] - text_height - padding,
+            )
+            box_bottom_right = (
+                text_origin[0] + text_width + padding,
+                text_origin[1] + baseline + padding,
+            )
+            cv2.rectangle(preview, box_top_left, box_bottom_right, (255, 255, 255), -1, lineType=cv2.LINE_8)
+            cv2.rectangle(preview, box_top_left, box_bottom_right, (0, 0, 0), 1, lineType=cv2.LINE_8)
+            cv2.putText(preview, label, text_origin, font, font_scale, (0, 0, 0), thickness, cv2.LINE_AA)
 
     for square in selected_squares:
         top_left = (int(round(square.x0 * scale)), int(round(square.y0 * scale)))
@@ -359,8 +389,10 @@ def circle_to_square(
 
     return Square(
         circle_index=circle.index,
+        roi_number=None,
         center_x=circle.x,
         center_y=circle.y,
+        circle_radius=circle.radius,
         diameter=2.0 * half_side,
         x0=x0,
         y0=y0,
@@ -369,44 +401,83 @@ def circle_to_square(
     )
 
 
-def filter_squares_by_layer5(
-    layer5: np.ndarray,
+def filter_squares_by_layer0_cell_region(
+    layer0: np.ndarray,
     squares: Iterable[Square],
-    brightness_threshold: int,
-    min_bright_pixels: int,
-    max_bright_pixels: int,
+    min_cell_threshold: int,
+    max_cell_threshold: int,
+    min_cell_area: int,
+    max_cell_area: int,
+    cell_search_circle_inset: float,
+    exclude_multiple_cell_regions: bool,
 ) -> list[Square]:
+    if cell_search_circle_inset < 0:
+        raise ValueError("--cell-search-circle-inset must be zero or greater.")
+
     selected: list[Square] = []
     for square in squares:
-        roi = layer5[square.y0 : square.y1, square.x0 : square.x1]
-        bright_count = int(np.count_nonzero(roi >= brightness_threshold))
-        if min_bright_pixels <= bright_count <= max_bright_pixels:
+        cell_search_radius = square.circle_radius - cell_search_circle_inset
+        if cell_search_radius <= 0:
+            continue
+
+        roi = layer0[square.y0 : square.y1, square.x0 : square.x1]
+        y_coords, x_coords = np.ogrid[square.y0 : square.y1, square.x0 : square.x1]
+        circle_mask = (
+            (x_coords - square.center_x) * (x_coords - square.center_x)
+            + (y_coords - square.center_y) * (y_coords - square.center_y)
+        ) <= cell_search_radius * cell_search_radius
+        cell_mask = ((roi >= min_cell_threshold) & (roi <= max_cell_threshold) & circle_mask).astype(np.uint8)
+        component_count, labels, stats, _centroids = cv2.connectedComponentsWithStats(cell_mask, connectivity=8)
+        if component_count <= 1:
+            continue
+
+        component_areas = stats[1:, cv2.CC_STAT_AREA]
+        matching_cell_region_count = int(np.count_nonzero((component_areas >= min_cell_area) & (component_areas <= max_cell_area)))
+        if exclude_multiple_cell_regions and matching_cell_region_count >= 2:
+            continue
+
+        largest_label = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+        largest_area = int(stats[largest_label, cv2.CC_STAT_AREA])
+        largest_component = (labels == largest_label).astype(np.uint8)
+        contours, _hierarchy = cv2.findContours(largest_component, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        perimeter = sum(cv2.arcLength(contour, True) for contour in contours)
+        circularity = 0.0 if perimeter <= 0 else float((4.0 * math.pi * largest_area) / (perimeter * perimeter))
+
+        if min_cell_area <= largest_area <= max_cell_area:
             selected.append(
                 Square(
                     circle_index=square.circle_index,
+                    roi_number=square.roi_number,
                     center_x=square.center_x,
                     center_y=square.center_y,
+                    circle_radius=square.circle_radius,
                     diameter=square.diameter,
                     x0=square.x0,
                     y0=square.y0,
                     x1=square.x1,
                     y1=square.y1,
-                    bright_pixel_count=bright_count,
+                    cell_region_area=largest_area,
+                    cell_region_circularity=circularity,
+                    matching_cell_region_count=matching_cell_region_count,
+                    cell_search_radius=cell_search_radius,
                 )
             )
     return selected
 
 
-def write_coordinates_csv(path: Path, squares: Iterable[Square]) -> None:
+def write_coordinates_csv(path: Path, squares: Iterable[Square], total_roi_count: int) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle)
         writer.writerow(
             [
                 "segment_index",
+                "roi_number",
+                "total_roi_count",
                 "circle_index",
                 "center_x",
                 "center_y",
+                "circle_radius",
                 "diameter",
                 "x0",
                 "y0",
@@ -416,7 +487,10 @@ def write_coordinates_csv(path: Path, squares: Iterable[Square]) -> None:
                 "top_right",
                 "bottom_right",
                 "bottom_left",
-                "bright_pixel_count",
+                "cell_region_area",
+                "cell_region_circularity",
+                "matching_cell_region_count",
+                "cell_search_radius",
             ]
         )
         for segment_index, square in enumerate(squares):
@@ -424,9 +498,12 @@ def write_coordinates_csv(path: Path, squares: Iterable[Square]) -> None:
             writer.writerow(
                 [
                     segment_index,
+                    square.roi_number,
+                    total_roi_count,
                     square.circle_index,
                     f"{square.center_x:.3f}",
                     f"{square.center_y:.3f}",
+                    f"{square.circle_radius:.3f}",
                     f"{square.diameter:.3f}",
                     square.x0,
                     square.y0,
@@ -436,17 +513,72 @@ def write_coordinates_csv(path: Path, squares: Iterable[Square]) -> None:
                     f"{top_right[0]}:{top_right[1]}",
                     f"{bottom_right[0]}:{bottom_right[1]}",
                     f"{bottom_left[0]}:{bottom_left[1]}",
-                    square.bright_pixel_count,
+                    square.cell_region_area,
+                    "" if square.cell_region_circularity is None else f"{square.cell_region_circularity:.4f}",
+                    square.matching_cell_region_count,
+                    "" if square.cell_search_radius is None else f"{square.cell_search_radius:.3f}",
                 ]
             )
 
 
-def prepare_segment_paths(output_dir: Path, squares: list[Square], overwrite: bool) -> list[Path]:
+def extract_well_prefix(input_tif_path: Path) -> str:
+    match = re.match(r"^(Well[A-Za-z]+[0-9]+)", input_tif_path.stem)
+    return match.group(1) if match else ""
+
+
+def prefixed_name(prefix: str, name: str) -> str:
+    return f"{prefix}_{name}" if prefix else name
+
+
+def number_circles_top_left(circles: Iterable[Circle]) -> dict[int, int]:
+    circle_list = list(circles)
+    if not circle_list:
+        return {}
+
+    sorted_radii = sorted(circle.radius for circle in circle_list)
+    median_radius = sorted_radii[len(sorted_radii) // 2]
+    row_tolerance = max(1.0, median_radius * 0.85)
+
+    rows: list[list[Circle]] = []
+    row_centers: list[float] = []
+    for circle in sorted(circle_list, key=lambda item: (item.y, item.x)):
+        if rows and abs(circle.y - row_centers[-1]) <= row_tolerance:
+            rows[-1].append(circle)
+            row_centers[-1] = sum(item.y for item in rows[-1]) / len(rows[-1])
+        else:
+            rows.append([circle])
+            row_centers.append(circle.y)
+
+    result: dict[int, int] = {}
+    roi_number = 1
+    for _row_center, row in sorted(zip(row_centers, rows, strict=True), key=lambda item: item[0]):
+        for circle in sorted(row, key=lambda item: (item.x - item.radius, item.x)):
+            result[circle.index] = roi_number
+            roi_number += 1
+    return result
+
+
+def format_roi_part(roi_number: int | None, total_roi_count: int) -> str:
+    if roi_number is None:
+        return f"roi_unknown_of{total_roi_count}"
+    width = max(1, len(str(max(1, total_roi_count))))
+    return f"roi_{roi_number:0{width}d}_of{total_roi_count}"
+
+
+def prepare_segment_paths(
+    output_dir: Path,
+    squares: list[Square],
+    overwrite: bool,
+    filename_prefix: str,
+    total_roi_count: int,
+) -> list[Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
     paths: list[Path] = []
     for segment_index, square in enumerate(squares):
+        roi_part = format_roi_part(square.roi_number, total_roi_count)
         path = output_dir / (
-            f"segment_{segment_index:06d}"
+            f"{prefixed_name(filename_prefix, roi_part)}"
+            f"_segment_{segment_index:06d}"
             f"_circle_{square.circle_index:06d}"
             f"_x{square.x0}_y{square.y0}_w{square.width}_h{square.height}.tif"
         )
@@ -481,31 +613,57 @@ def write_segment_pages(
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Detect circles on layer 0 of a multilayer 16-bit TIFF, filter square ROIs by layer 5 "
-            "brightness, and export selected ROIs as multilayer TIFF files."
+            "Detect circles on layer 0 of a multilayer 16-bit TIFF, filter circles by the largest "
+            "layer 0 threshold component inside each circle, and export selected square ROIs as multilayer TIFF files."
         )
     )
     parser.add_argument("input_tif", type=Path, help="Input multilayer TIFF path.")
     parser.add_argument(
-        "--brightness-threshold",
+        "--min-cell-threshold",
+        "--min-dark-threshold",
+        dest="min_cell_threshold",
+        type=int,
+        default=0,
+        help="Input #1: layer 0 cell mask minimum threshold. Pixels >= this value are included. Default: 0.",
+    )
+    parser.add_argument(
+        "--max-cell-threshold",
+        "--max-dark-threshold",
+        dest="max_cell_threshold",
         type=int,
         default=30000,
-        help="Input #1: layer 5 brightness threshold. Default: 30000.",
+        help="Input #2: layer 0 cell mask maximum threshold. Pixels <= this value are included. Default: 30000.",
     )
     parser.add_argument(
-        "--min-bright-pixels",
+        "--min-cell-area",
+        "--min-dark-pixels",
+        dest="min_cell_area",
         type=int,
         default=20000,
-        help="Input #2: selected when count of pixels >= brightness threshold is this value or greater. Default: 20000.",
+        help="Input #3: selected when the largest threshold component inside the circle is this area or greater. Default: 20000.",
     )
     parser.add_argument(
-        "--max-bright-pixels",
+        "--max-cell-area",
+        "--max-dark-pixels",
+        dest="max_cell_area",
         type=int,
         default=300000,
-        help="Input #3: selected when count of pixels >= brightness threshold is this value or smaller. Default: 300000.",
+        help="Input #4: selected when the largest threshold component inside the circle is this area or smaller. Default: 300000.",
+    )
+    parser.add_argument(
+        "--cell-search-circle-inset",
+        type=float,
+        default=0.0,
+        help="Shrink the circle mask inward by this many original pixels before finding the largest cell component. Default: 0.",
+    )
+    parser.add_argument(
+        "--exclude-multiple-cell-regions",
+        action="store_true",
+        help="Exclude an ROI when two or more threshold components inside the circle satisfy the cell area range.",
     )
     parser.add_argument("--output-dir", type=Path, default=Path("segments"), help="Directory for exported segment TIFFs.")
     parser.add_argument("--coords-csv", type=Path, default=Path("selected_squares.csv"), help="CSV path for selected square vertices.")
+    parser.add_argument("--filename-prefix", default="", help="Prefix to prepend to exported segment TIFF filenames.")
     parser.add_argument("--export-layers", type=parse_layers, default=DEFAULT_EXPORT_LAYERS, help="Comma-separated layer indexes to export.")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing segment TIFF files.")
     parser.add_argument("--allow-edge-clipping", action="store_true", help="Clamp squares that extend beyond image bounds.")
@@ -536,6 +694,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--preview", action="store_true", help="Show detected circles in an OpenCV preview window.")
     parser.add_argument("--preview-only", action="store_true", help="Stop after showing/saving detected circle preview.")
+    parser.add_argument("--preview-roi-numbers", action="store_true", help="Draw circle-based ROI numbers at circle centers in the preview image.")
     parser.add_argument(
         "--preview-output",
         default="outputs/detected_circles_preview.png",
@@ -564,8 +723,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = build_arg_parser().parse_args()
     input_tif_path = args.input_tif.resolve()
-    if args.max_bright_pixels < args.min_bright_pixels:
-        raise ValueError("--max-bright-pixels must be greater than or equal to --min-bright-pixels.")
+    filename_prefix = args.filename_prefix or extract_well_prefix(input_tif_path)
+    if args.max_cell_threshold < args.min_cell_threshold:
+        raise ValueError("--max-cell-threshold must be greater than or equal to --min-cell-threshold.")
+    if args.max_cell_area < args.min_cell_area:
+        raise ValueError("--max-cell-area must be greater than or equal to --min-cell-area.")
+    if args.cell_search_circle_inset < 0:
+        raise ValueError("--cell-search-circle-inset must be zero or greater.")
     min_radius, max_radius = radius_bounds_from_diameter(
         args.circle_diameter,
         args.diameter_tolerance,
@@ -600,6 +764,8 @@ def main() -> None:
         print(f"Circles after overlap merge: {len(circles)}")
         print(f"Circle radius bounds used: min={min_radius}, max={max_radius if max_radius > 0 else 'none'}")
 
+        circle_roi_numbers = number_circles_top_left(circles)
+        total_roi_count = len(circles)
         candidate_squares: list[Square] = []
         for circle in circles:
             square = circle_to_square(
@@ -609,21 +775,22 @@ def main() -> None:
                 args.segment_diagonal_padding,
             )
             if square is not None:
-                candidate_squares.append(square)
-        print(f"Candidate squares inside image bounds: {len(candidate_squares)}")
+                candidate_squares.append(replace(square, roi_number=circle_roi_numbers[circle.index]))
+        candidate_squares.sort(key=lambda square: square.roi_number or 0)
+        print(f"Circle-based ROI count: {total_roi_count}")
+        print(f"Candidate squares available for segmentation: {len(candidate_squares)}")
 
-        layer5 = open_layer(tif, 5)
-        if layer5.shape != layer0.shape:
-            raise ValueError(f"Layer 5 shape {layer5.shape!r} does not match layer 0 shape {layer0.shape!r}")
-
-        selected_squares = filter_squares_by_layer5(
-            layer5,
+        selected_squares = filter_squares_by_layer0_cell_region(
+            layer0,
             candidate_squares,
-            args.brightness_threshold,
-            args.min_bright_pixels,
-            args.max_bright_pixels,
+            args.min_cell_threshold,
+            args.max_cell_threshold,
+            args.min_cell_area,
+            args.max_cell_area,
+            args.cell_search_circle_inset,
+            args.exclude_multiple_cell_regions,
         )
-        print(f"Selected squares after layer 5 brightness filter: {len(selected_squares)}")
+        print(f"Selected squares after layer 0 largest cell-region filter: {len(selected_squares)}")
 
         write_or_show_circle_preview(
             layer0,
@@ -635,19 +802,21 @@ def main() -> None:
             low_percentile=args.low_percentile,
             high_percentile=args.high_percentile,
             invert=args.invert,
+            show_roi_numbers=args.preview_roi_numbers,
+            roi_numbers=circle_roi_numbers,
         )
         if args.preview_only:
             print("Preview-only mode enabled. Skipping segment export.")
             return
 
-    write_coordinates_csv(args.coords_csv, selected_squares)
+    write_coordinates_csv(args.coords_csv, selected_squares, total_roi_count)
     print(f"Wrote coordinates CSV: {args.coords_csv}")
 
     if not selected_squares:
         print("No segments exported because no squares passed the filter.")
         return
 
-    segment_paths = prepare_segment_paths(args.output_dir, selected_squares, args.overwrite)
+    segment_paths = prepare_segment_paths(args.output_dir, selected_squares, args.overwrite, filename_prefix, total_roi_count)
     write_segment_pages(input_tif_path, selected_squares, segment_paths, args.export_layers)
     print(f"Wrote segment TIFFs: {len(segment_paths)} files in {args.output_dir}")
 

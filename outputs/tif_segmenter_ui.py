@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import queue
+import re
 import subprocess
 import sys
 import threading
@@ -17,6 +18,15 @@ WORKSPACE_DIR = APP_DIR.parent
 SEGMENTER = APP_DIR / "multilayer_tif_circle_segmenter.py"
 DEFAULT_TIF = next((WORKSPACE_DIR / "work").glob("*.tif"), "")
 DEFAULT_OUTPUT_DIR = APP_DIR / "segments"
+
+
+def extract_well_prefix(path: Path) -> str:
+    match = re.match(r"^(Well[A-Za-z]+[0-9]+)", path.stem)
+    return match.group(1) if match else ""
+
+
+def prefixed_name(prefix: str, name: str) -> str:
+    return f"{prefix}_{name}" if prefix else name
 
 
 class SegmenterUi(tk.Tk):
@@ -36,8 +46,13 @@ class SegmenterUi(tk.Tk):
 
         self.input_path = tk.StringVar(value=str(DEFAULT_TIF) if DEFAULT_TIF else "")
         self.output_dir = tk.StringVar(value=str(DEFAULT_OUTPUT_DIR))
+        self.last_input_dir = DEFAULT_TIF.parent if DEFAULT_TIF else WORKSPACE_DIR / "work"
+        self.last_output_dir = DEFAULT_OUTPUT_DIR
         self.status = tk.StringVar(value="Ready")
         self.preview_path = APP_DIR / "detected_circles_preview_ui.png"
+        self.exclude_multiple_cell_regions = tk.BooleanVar(value=True)
+        self.allow_edge_clipping = tk.BooleanVar(value=True)
+        self.preview_roi_numbers = tk.BooleanVar(value=False)
 
         self.params: dict[str, tk.StringVar] = {
             "circle_diameter": tk.StringVar(value="1515"),
@@ -49,10 +64,12 @@ class SegmenterUi(tk.Tk):
             "param2": tk.StringVar(value="30"),
             "dp": tk.StringVar(value="1.2"),
             "overlap_merge_center_tolerance": tk.StringVar(value="0.25"),
-            "brightness_threshold": tk.StringVar(value="30000"),
-            "min_bright_pixels": tk.StringVar(value="20000"),
-            "max_bright_pixels": tk.StringVar(value="300000"),
-            "segment_diagonal_padding": tk.StringVar(value="200"),
+            "min_cell_threshold": tk.StringVar(value="2000"),
+            "max_cell_threshold": tk.StringVar(value="33000"),
+            "min_cell_area": tk.StringVar(value="5000"),
+            "max_cell_area": tk.StringVar(value="300000"),
+            "cell_search_circle_inset": tk.StringVar(value="400"),
+            "segment_diagonal_padding": tk.StringVar(value="300"),
         }
 
         self._build_style()
@@ -111,14 +128,31 @@ class SegmenterUi(tk.Tk):
             ("param2", "param2"),
             ("dp", "dp"),
             ("overlap merge tolerance", "overlap_merge_center_tolerance"),
-            ("brightness threshold", "brightness_threshold"),
-            ("min bright pixels", "min_bright_pixels"),
-            ("max bright pixels", "max_bright_pixels"),
+            ("min cell threshold", "min_cell_threshold"),
+            ("max cell threshold", "max_cell_threshold"),
+            ("min cell region area", "min_cell_area"),
+            ("max cell region area", "max_cell_area"),
+            ("cell search circle inset", "cell_search_circle_inset"),
             ("segment diagonal padding", "segment_diagonal_padding"),
         ]
         for row, (label, key) in enumerate(fields):
             ttk.Label(form, text=label).grid(row=row, column=0, sticky="w", pady=4)
             ttk.Entry(form, textvariable=self.params[key], width=18).grid(row=row, column=1, sticky="ew", pady=4)
+        ttk.Checkbutton(
+            form,
+            text="exclude multiple cell regions",
+            variable=self.exclude_multiple_cell_regions,
+        ).grid(row=len(fields), column=0, columnspan=2, sticky="w", pady=(8, 4))
+        ttk.Checkbutton(
+            form,
+            text="allow edge clipping",
+            variable=self.allow_edge_clipping,
+        ).grid(row=len(fields) + 1, column=0, columnspan=2, sticky="w", pady=4)
+        ttk.Checkbutton(
+            form,
+            text="show ROI numbers in preview",
+            variable=self.preview_roi_numbers,
+        ).grid(row=len(fields) + 2, column=0, columnspan=2, sticky="w", pady=4)
 
         button_row = ttk.Frame(left)
         button_row.grid(row=6, column=0, sticky="ew", pady=(0, 16))
@@ -149,21 +183,31 @@ class SegmenterUi(tk.Tk):
         self.log.configure(yscrollcommand=scrollbar.set)
 
     def _browse_file(self) -> None:
+        current_input = Path(self.input_path.get().strip())
+        if current_input.parent.exists():
+            self.last_input_dir = current_input.parent
         path = filedialog.askopenfilename(
-            initialdir=str(WORKSPACE_DIR / "work"),
+            initialdir=str(self.last_input_dir),
             title="Select multilayer TIFF",
             filetypes=[("TIFF files", "*.tif *.tiff"), ("All files", "*.*")],
         )
         if path:
             self.input_path.set(path)
+            self.last_input_dir = Path(path).parent
 
     def _browse_output_dir(self) -> None:
+        current_output = Path(self.output_dir.get().strip())
+        if current_output.exists():
+            self.last_output_dir = current_output
+        elif current_output.parent.exists():
+            self.last_output_dir = current_output.parent
         path = filedialog.askdirectory(
-            initialdir=str(Path(self.output_dir.get()).parent if self.output_dir.get() else APP_DIR),
+            initialdir=str(self.last_output_dir),
             title="Select output folder for segment TIFFs",
         )
         if path:
             self.output_dir.set(path)
+            self.last_output_dir = Path(path)
 
     def _validate_params(self) -> list[str] | None:
         path = Path(self.input_path.get().strip())
@@ -181,9 +225,11 @@ class SegmenterUi(tk.Tk):
             ("param2", "param2", float),
             ("dp", "dp", float),
             ("overlap merge tolerance", "overlap_merge_center_tolerance", float),
-            ("brightness threshold", "brightness_threshold", int),
-            ("min bright pixels", "min_bright_pixels", int),
-            ("max bright pixels", "max_bright_pixels", int),
+            ("min cell threshold", "min_cell_threshold", int),
+            ("max cell threshold", "max_cell_threshold", int),
+            ("min cell region area", "min_cell_area", int),
+            ("max cell region area", "max_cell_area", int),
+            ("cell search circle inset", "cell_search_circle_inset", float),
             ("segment diagonal padding", "segment_diagonal_padding", float),
         ]
         values: dict[str, str] = {}
@@ -195,21 +241,31 @@ class SegmenterUi(tk.Tk):
         except ValueError:
             messagebox.showerror("Invalid value", f"Check numeric input for {label}.")
             return None
-        if int(values["max_bright_pixels"]) < int(values["min_bright_pixels"]):
-            messagebox.showerror("Invalid range", "max bright pixels must be greater than or equal to min bright pixels.")
+        if int(values["max_cell_threshold"]) < int(values["min_cell_threshold"]):
+            messagebox.showerror("Invalid range", "max cell threshold must be greater than or equal to min cell threshold.")
+            return None
+        if int(values["max_cell_area"]) < int(values["min_cell_area"]):
+            messagebox.showerror("Invalid range", "max cell region area must be greater than or equal to min cell region area.")
+            return None
+        if float(values["cell_search_circle_inset"]) < 0:
+            messagebox.showerror("Invalid value", "cell search circle inset must be zero or greater.")
             return None
         if float(values["segment_diagonal_padding"]) < 0:
             messagebox.showerror("Invalid value", "segment diagonal padding must be zero or greater.")
             return None
 
-        return [
+        args = [
             str(path),
-            "--brightness-threshold",
-            values["brightness_threshold"],
-            "--min-bright-pixels",
-            values["min_bright_pixels"],
-            "--max-bright-pixels",
-            values["max_bright_pixels"],
+            "--min-cell-threshold",
+            values["min_cell_threshold"],
+            "--max-cell-threshold",
+            values["max_cell_threshold"],
+            "--min-cell-area",
+            values["min_cell_area"],
+            "--max-cell-area",
+            values["max_cell_area"],
+            "--cell-search-circle-inset",
+            values["cell_search_circle_inset"],
             "--segment-diagonal-padding",
             values["segment_diagonal_padding"],
             "--circle-diameter",
@@ -233,11 +289,20 @@ class SegmenterUi(tk.Tk):
             "--downsample-max-dim",
             "2048",
         ]
+        if self.exclude_multiple_cell_regions.get():
+            args.append("--exclude-multiple-cell-regions")
+        if self.allow_edge_clipping.get():
+            args.append("--allow-edge-clipping")
+        if self.preview_roi_numbers.get():
+            args.append("--preview-roi-numbers")
+        return args
 
     def _run_preview(self) -> None:
         args = self._validate_params()
         if args is None:
             return
+        well_prefix = extract_well_prefix(Path(self.input_path.get().strip()))
+        self.preview_path = APP_DIR / prefixed_name(well_prefix, "detected_circles_preview_ui.png")
         command = [
             sys.executable,
             str(SEGMENTER),
@@ -261,9 +326,12 @@ class SegmenterUi(tk.Tk):
             return
         output_dir = Path(raw_output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
+        preview_dir = output_dir / "preview"
+        preview_dir.mkdir(parents=True, exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        coords_csv = output_dir / f"selected_squares_{timestamp}.csv"
-        preview_png = output_dir / f"detected_circles_preview_{timestamp}.png"
+        well_prefix = extract_well_prefix(Path(self.input_path.get().strip()))
+        coords_csv = output_dir / prefixed_name(well_prefix, f"selected_squares_{timestamp}.csv")
+        preview_png = preview_dir / prefixed_name(well_prefix, f"detected_circles_preview_{timestamp}.png")
         command = [
             sys.executable,
             str(SEGMENTER),
@@ -274,6 +342,8 @@ class SegmenterUi(tk.Tk):
             str(output_dir),
             "--coords-csv",
             str(coords_csv),
+            "--filename-prefix",
+            well_prefix,
             "--overwrite",
         ]
         self._start_command(command, f"Applying. Output: {output_dir}", on_success=lambda: self._apply_done(output_dir, preview_png))
